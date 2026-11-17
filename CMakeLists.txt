@@ -14,7 +14,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+if(MSVC)
+  add_compile_options(/utf-8 /EHsc /W3)
+  # OpenCPN ships an old msvcp140.dll (14.12). The VS 2022 STL initialises std::mutex in a way that old runtime
+  # cannot handle (crash on first use), so use the compatible constructor, as OpenCPN itself does.
+  add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR _CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS _USE_MATH_DEFINES NOMINMAX WIN32_LEAN_AND_MEAN)
+elseif(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl -undefined dynamic_lookup")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,-Bsymbolic")
@@ -176,7 +181,11 @@ set(SRC
 add_executable(navico_sim_cli EXCLUDE_FROM_ALL
   src/ais_encoder.cpp src/ais_sim.cpp src/navico_sim.cpp src/scene.cpp src/s57_reader.cpp src/weather.cpp src/clutter.cpp src/navico_sim_cli.cpp)
 target_include_directories(navico_sim_cli PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(navico_sim_cli PRIVATE pthread)
+if(WIN32)
+  target_link_libraries(navico_sim_cli PRIVATE ws2_32 iphlpapi)
+else()
+  target_link_libraries(navico_sim_cli PRIVATE pthread)
+endif()
 
 # Dev tool: ENC extract to text, to validate the native S-57 reader against tools/enc_extract.py.
 add_executable(s57_extract_cli EXCLUDE_FROM_ALL src/s57_extract_cli.cpp src/s57_reader.cpp)
@@ -190,6 +199,16 @@ target_include_directories(${PKG_NAME}
     ${OPENCPN_INCLUDE_DIR}
 )
 target_link_libraries(${PKG_NAME} PRIVATE ${wxWidgets_LIBRARIES})
+target_compile_definitions(${PKG_NAME} PRIVATE MAKING_PLUGIN)
+
+if(WIN32)
+  # The plugin resolves the opencpn_plugin base class (and friends) from opencpn.exe through its import library.
+  set(OPENCPN_IMPLIB "" CACHE FILEPATH "Path to OpenCPN's import library opencpn.lib")
+  if(NOT OPENCPN_IMPLIB OR NOT EXISTS "${OPENCPN_IMPLIB}")
+    message(FATAL_ERROR "Set -DOPENCPN_IMPLIB=<path to opencpn.lib> (see BUILD.md)")
+  endif()
+  target_link_libraries(${PKG_NAME} PRIVATE ws2_32 iphlpapi "${OPENCPN_IMPLIB}")
+endif()
 
 if(APPLE)
   set(_fixup_wx_script "${CMAKE_BINARY_DIR}/fixup_wx_rpaths.cmake")
@@ -275,9 +294,17 @@ set(files_dir \"\${root}/files\")
 set(package_root \"\${root}/${pkg_displayname}\")
 
 file(REMOVE_RECURSE \"\${root}\")
+set(config_args \"\")
+if(BUILD_CONFIG)
+  set(config_args --config \${BUILD_CONFIG})
+endif()
 execute_process(
-  COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --prefix \${files_dir}
+  COMMAND \"${CMAKE_COMMAND}\" --install \"${CMAKE_BINARY_DIR}\" \${config_args} --prefix \"\${files_dir}\"
+  RESULT_VARIABLE install_result
 )
+if(NOT install_result EQUAL 0)
+  message(FATAL_ERROR \"install step failed: \${install_result}\")
+endif()
 configure_file(
   ${CMAKE_BINARY_DIR}/${pkg_displayname}.xml.in
   ${CMAKE_BINARY_DIR}/app/files/metadata.xml
@@ -294,9 +321,17 @@ execute_process(
 ")
 file(WRITE "${CMAKE_BINARY_DIR}/make_tarball.cmake" "${_tarball_script}")
 
+get_property(_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(_multi_config)  # Visual Studio / Xcode: build and install the configuration the tarball was requested with
+  set(_build_config_args --config $<CONFIG>)
+  set(_script_config_arg -DBUILD_CONFIG=$<CONFIG>)
+else()
+  set(_build_config_args "")
+  set(_script_config_arg "")
+endif()
 add_custom_target(tarball
-  COMMAND cmake --build ${CMAKE_BINARY_DIR} --target ${PKG_NAME}
-  COMMAND cmake -P ${CMAKE_BINARY_DIR}/make_tarball.cmake
+  COMMAND cmake --build ${CMAKE_BINARY_DIR} ${_build_config_args} --target ${PKG_NAME}
+  COMMAND cmake ${_script_config_arg} -P ${CMAKE_BINARY_DIR}/make_tarball.cmake
   DEPENDS ${PKG_NAME}
   VERBATIM
 )

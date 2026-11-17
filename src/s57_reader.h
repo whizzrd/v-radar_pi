@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -25,13 +26,15 @@ struct GeoBox { double lon_min, lat_min, lon_max, lat_max; };
 
 // All *.000 base cells below the given directories (OpenCPN chart directories). A trailing
 // '^' or '*' marker, as OpenCPN stores in its chart directory list, is ignored.
-std::vector<std::string> FindEncCells(const std::vector<std::string>& dirs);
+// cancel (optional): when it becomes true the search stops early and returns what it has.
+std::vector<std::string> FindEncCells(const std::vector<std::string>& dirs, const std::atomic<bool>* cancel = nullptr);
 
 // Reads every cell that overlaps a radius around (lat, lon). index_file (may be empty) caches the
 // cell extents so that later calls only open the cells that matter. Cells that are cloud
 // placeholders (macOS "dataless") are skipped: reading them would trigger a download.
+// cancel (optional): checked between cells; the extents found so far are still saved to index_file.
 void CollectRegion(const std::vector<std::string>& cells, double lat, double lon, double radius_nm,
-                   const std::string& index_file, EncData& out);
+                   const std::string& index_file, EncData& out, const std::atomic<bool>* cancel = nullptr);
 
 // Parses one cell, keeping features that touch box. Returns false (with err) on a malformed file.
 // Update files (.001 ...) are not applied.

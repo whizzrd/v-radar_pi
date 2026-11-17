@@ -68,6 +68,11 @@ class VRadarEngine : public wxEvtHandler {
   void UpdateWeather(const radarsim::OwnShip& ship);
   void SampleGrib(void* record_set, const radarsim::OwnShip& ship);
   void ExtractAndLoad(double lat, double lon, double radius_nm, std::vector<std::string> dirs, std::string index_file);
+  // The ENC worker must not call wxLog itself: wx queues records from other threads until the GUI thread is idle,
+  // and such a record keeps a pointer into this DLL (its __FILE__). If OpenCPN has unloaded the plugin by then,
+  // OpenCPN's logger crashes on it. The worker queues its messages here and the GUI thread logs them.
+  void QueueLog(wxLogLevel level, std::string msg);
+  void FlushLog();
 
   VRadarPi& m_plugin;
   wxTimer m_timer;
@@ -81,6 +86,9 @@ class VRadarEngine : public wxEvtHandler {
   std::atomic<int> m_cells_found{0}, m_cells_used{0};
   std::atomic<bool> m_rebuild_ais{false};
   std::thread m_worker;
+  std::atomic<bool> m_cancel{false};  // asks the ENC worker to stop (plugin deactivated or shutting down)
+  std::mutex m_log_mu;
+  std::vector<std::pair<wxLogLevel, std::string>> m_log_queue;
   long m_tick = 0;
 
   // weather
