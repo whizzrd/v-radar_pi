@@ -6,7 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <dirent.h>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -285,39 +285,38 @@ bool ReadS57Cell(const std::string& path, const GeoBox& box, int layer, int urba
   return true;
 }
 
-std::vector<std::string> FindEncCells(const std::vector<std::string>& dirs) {
+std::vector<std::string> FindEncCells(const std::vector<std::string>& dirs, const std::atomic<bool>* cancel) {
   std::vector<std::string> cells;
   std::vector<std::string> todo;
   for (std::string d : dirs) {
     size_t m = d.find_first_of("^*");
     if (m != std::string::npos) d.resize(m);
-    while (d.size() > 1 && d.back() == '/') d.pop_back();
+    while (d.size() > 1 && (d.back() == '/' || d.back() == '\\') && !(d.size() == 3 && d[1] == ':')) d.pop_back();
     if (!d.empty()) todo.push_back(d);
   }
   std::sort(todo.begin(), todo.end());
   todo.erase(std::unique(todo.begin(), todo.end()), todo.end());
   while (!todo.empty()) {
+    if (cancel && cancel->load()) break;
     std::string d = todo.back();
     todo.pop_back();
-    DIR* dp = opendir(d.c_str());
-    if (!dp) continue;
-    while (dirent* e = readdir(dp)) {
-      std::string n = e->d_name;
-      if (n == "." || n == "..") continue;
-      std::string full = d + "/" + n;
-      struct stat st;
-      if (stat(full.c_str(), &st) != 0) continue;
-      if (S_ISDIR(st.st_mode)) todo.push_back(full);
-      else if (n.size() > 4 && n.compare(n.size() - 4, 4, ".000") == 0) cells.push_back(full);
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::directory_iterator it(fs::path(d), ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+      const std::string n = it->path().filename().string();
+      const std::string full = (d.back() == '/' || d.back() == '\\') ? d + n : d + "/" + n;
+      std::error_code ec2;
+      if (it->is_directory(ec2)) todo.push_back(full);
+      else if (n.size() > 4 && n.compare(n.size() - 4, 4, ".000") == 0 && it->is_regular_file(ec2)) cells.push_back(full);
     }
-    closedir(dp);
   }
   std::sort(cells.begin(), cells.end());
   return cells;
 }
 
 void CollectRegion(const std::vector<std::string>& cells, double lat, double lon, double radius_nm,
-                   const std::string& index_file, EncData& out) {
+                   const std::string& index_file, EncData& out, const std::atomic<bool>* cancel) {
   const double dlat = radius_nm / 60.0;
   const double dlon = dlat / std::max(0.1, std::cos(lat * 3.14159265358979 / 180.0));
   const GeoBox box{lon - dlon, lat - dlat, lon + dlon, lat + dlat};
@@ -338,6 +337,7 @@ void CollectRegion(const std::vector<std::string>& cells, double lat, double lon
   }
   out.cells_found = (int)cells.size();
   for (const std::string& path : cells) {
+    if (cancel && cancel->load()) break;
     struct stat st;
     if (stat(path.c_str(), &st) != 0 || IsCloudPlaceholder(st)) { out.cells_skipped++; continue; }
     GeoBox ext;
@@ -354,7 +354,7 @@ void CollectRegion(const std::vector<std::string>& cells, double lat, double lon
     std::string err;
     const int layer = (int)out.layers.size();
     // navigational purpose = third character of the cell name (1 overview ... 6 berthing)
-    std::string base = path.substr(path.find_last_of('/') + 1);
+    std::string base = path.substr(path.find_last_of("/\\") + 1);
     int band = (base.size() > 2 && base[2] >= '0' && base[2] <= '9') ? base[2] - '0' : 0;
     out.layers.push_back({ext.lon_min, ext.lat_min, ext.lon_max, ext.lat_max, band, false});
     out.layers.push_back({ext.lon_min, ext.lat_min, ext.lon_max, ext.lat_max, band, true});  // built-up areas of this cell
@@ -370,7 +370,9 @@ void CollectRegion(const std::vector<std::string>& cells, double lat, double lon
         o << kv.first << '\t' << kv.second.mtime << ' ' << kv.second.ext.lon_min << ' ' << kv.second.ext.lat_min << ' '
           << kv.second.ext.lon_max << ' ' << kv.second.ext.lat_max << '\n';
     }
-    std::rename(tmp.c_str(), index_file.c_str());
+    // std::rename fails on Windows when the target exists; std::filesystem::rename replaces it on every platform.
+    std::error_code rename_ec;
+    std::filesystem::rename(tmp, index_file, rename_ec);
   }
 }
 

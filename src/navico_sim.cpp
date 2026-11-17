@@ -1,5 +1,16 @@
 #include "navico_sim.h"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#else
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -7,6 +18,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -14,6 +26,16 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <thread>
+
+#ifdef _WIN32
+#define CLOSE_SOCKET(s) closesocket((SOCKET)(s))
+#define FD_SOCK(s) ((SOCKET)(s))
+#else
+#define CLOSE_SOCKET(s) close(s)
+#define FD_SOCK(s) (s)
+#endif
 
 namespace radarsim {
 namespace {
@@ -57,7 +79,7 @@ struct Beacon01B2 {
 
 PackedAddr Addr(const char* ip, uint16_t port) {
   PackedAddr a;
-  in_addr_t v = inet_addr(ip);
+  uint32_t v = inet_addr(ip);
   std::memcpy(&a.ip, &v, 4);
   a.port = htons(port);
   return a;
@@ -74,6 +96,44 @@ NavicoSim::NavicoSim(SimConfig cfg, std::shared_ptr<Scene> scene, ShipFn ship, s
 NavicoSim::~NavicoSim() { Stop(); }
 
 // Multicast-capable, non-loopback IPv4 interface addresses that are up right now.
+#ifdef _WIN32
+static void EnsureWinsock() {
+  static std::once_flag once;  // WSAStartup is reference counted; the process end cleans up
+  std::call_once(once, [] { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); });
+}
+
+static std::vector<std::string> CurrentIps(const std::vector<std::string>& wanted) {
+  std::vector<std::string> ips;
+  ULONG size = 16 * 1024;
+  std::vector<unsigned char> buf;
+  ULONG rc = ERROR_BUFFER_OVERFLOW;
+  const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+  for (int tries = 0; tries < 4 && rc == ERROR_BUFFER_OVERFLOW; tries++) {
+    buf.resize(size);
+    rc = GetAdaptersAddresses(AF_INET, flags, nullptr, (IP_ADAPTER_ADDRESSES*)buf.data(), &size);
+  }
+  if (rc != NO_ERROR) return ips;
+  for (IP_ADAPTER_ADDRESSES* a = (IP_ADAPTER_ADDRESSES*)buf.data(); a; a = a->Next) {
+    if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+    if (a->Flags & IP_ADAPTER_NO_MULTICAST) continue;
+    for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u; u = u->Next) {
+      if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+      char ip[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &((sockaddr_in*)u->Address.lpSockaddr)->sin_addr, ip, sizeof ip);
+      if (!wanted.empty()) {
+        bool ok = false;
+        for (auto& w : wanted) ok |= (w == ip);
+        if (!ok) continue;
+      }
+      ips.push_back(ip);
+    }
+  }
+  std::sort(ips.begin(), ips.end());
+  return ips;
+}
+#else
+static void EnsureWinsock() {}
+
 static std::vector<std::string> CurrentIps(const std::vector<std::string>& wanted) {
   std::vector<std::string> ips;
   ifaddrs* list = nullptr;
@@ -94,32 +154,36 @@ static std::vector<std::string> CurrentIps(const std::vector<std::string>& wante
   std::sort(ips.begin(), ips.end());
   return ips;
 }
+#endif
 
 void NavicoSim::OpenNics() {
+  EnsureWinsock();
   for (const std::string& ipstr : CurrentIps(cfg_.interfaces)) {
     Nic n; n.ip = ipstr;
     in_addr ifaddr{}; inet_pton(AF_INET, ipstr.c_str(), &ifaddr);
-    n.sock = socket(AF_INET, SOCK_DGRAM, 0);
+    n.sock = (int)socket(AF_INET, SOCK_DGRAM, 0);
     if (n.sock < 0) continue;
     // TTL 0 keeps the multicast stream on this computer (the Radar plugin still receives it). The spoke stream is
     // several Mbit/s and is sent as large fragmented datagrams: on Wi-Fi that saturates the whole network.
     unsigned char ttl = share_ ? 2 : 0, loop = 1;
-    setsockopt(n.sock, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof ifaddr);
-    setsockopt(n.sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, 1);
-    setsockopt(n.sock, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, 1);
+    setsockopt(n.sock, IPPROTO_IP, IP_MULTICAST_IF, (const char*)&ifaddr, sizeof ifaddr);
+    setsockopt(n.sock, IPPROTO_IP, IP_MULTICAST_TTL, (const char*)&ttl, 1);
+    setsockopt(n.sock, IPPROTO_IP, IP_MULTICAST_LOOP, (const char*)&loop, 1);
     int big = 1 << 20;
-    setsockopt(n.sock, SOL_SOCKET, SO_SNDBUF, &big, sizeof big);
+    setsockopt(n.sock, SOL_SOCKET, SO_SNDBUF, (const char*)&big, sizeof big);
     // command receiver: join the "send" group on this interface
-    n.rx = socket(AF_INET, SOCK_DGRAM, 0);
+    n.rx = (int)socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1;
-    setsockopt(n.rx, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    setsockopt(n.rx, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+    setsockopt(n.rx, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
+#ifdef SO_REUSEPORT  // Windows has no SO_REUSEPORT: SO_REUSEADDR already allows several binders there
+    setsockopt(n.rx, SOL_SOCKET, SO_REUSEPORT, (const char*)&one, sizeof one);
+#endif
     sockaddr_in bindaddr{}; bindaddr.sin_family = AF_INET;
     bindaddr.sin_port = htons(kSendPort); bindaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     ip_mreq mreq{}; mreq.imr_multiaddr.s_addr = inet_addr(kSendGroup); mreq.imr_interface = ifaddr;
     if (bind(n.rx, (sockaddr*)&bindaddr, sizeof bindaddr) != 0 ||
-        setsockopt(n.rx, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof mreq) != 0) {
-      close(n.rx); n.rx = -1;
+        setsockopt(n.rx, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof mreq) != 0) {
+      CLOSE_SOCKET(n.rx); n.rx = -1;
     }
     nics_.push_back(n);
   }
@@ -127,7 +191,7 @@ void NavicoSim::OpenNics() {
 }
 
 void NavicoSim::CloseNics() {
-  for (auto& n : nics_) { if (n.sock >= 0) close(n.sock); if (n.rx >= 0) close(n.rx); }
+  for (auto& n : nics_) { if (n.sock >= 0) CLOSE_SOCKET(n.sock); if (n.rx >= 0) CLOSE_SOCKET(n.rx); }
   nics_.clear();
   nic_count_ = 0;
 }
@@ -152,7 +216,7 @@ void NavicoSim::Stop() {
 
 void NavicoSim::SendAll(const std::string& group, uint16_t port, const void* data, size_t len) {
   sockaddr_in to{}; to.sin_family = AF_INET; to.sin_port = htons(port); to.sin_addr.s_addr = inet_addr(group.c_str());
-  for (auto& n : nics_) sendto(n.sock, data, len, 0, (sockaddr*)&to, sizeof to);
+  for (auto& n : nics_) sendto(n.sock, (const char*)data, (int)len, 0, (sockaddr*)&to, sizeof to);
 }
 
 void NavicoSim::SendBeacon() {
@@ -167,7 +231,7 @@ void NavicoSim::SendBeacon() {
     // secondary (dual range) addresses: not simulated
     b.dataB = Addr("236.6.7.13", 6657); b.sendB = Addr("236.6.7.14", 6658); b.reportB = Addr("236.6.7.15", 6659);
     sockaddr_in to{}; to.sin_family = AF_INET; to.sin_port = htons(kBeaconPort); to.sin_addr.s_addr = inet_addr(kBeaconGroup);
-    sendto(n.sock, &b, sizeof b, 0, (sockaddr*)&to, sizeof to);
+    sendto(n.sock, (const char*)&b, (int)sizeof b, 0, (sockaddr*)&to, sizeof to);
   }
 }
 
@@ -282,7 +346,14 @@ void NavicoSim::ApplyMode(int mode) {
 
 void NavicoSim::HandleCommand(const uint8_t* p, size_t len) {
   if (len < 3) return;
-  static FILE* dbg = std::getenv("VRADAR_DEBUG") ? std::fopen((std::string(std::getenv("HOME")) + "/Library/Logs/v-radar-commands.log").c_str(), "a") : nullptr;
+#ifdef _WIN32
+  const char* log_dir = std::getenv("TEMP");
+  const std::string log_path = std::string(log_dir ? log_dir : ".") + "\\v-radar-commands.log";
+#else
+  const char* log_home = std::getenv("HOME");
+  const std::string log_path = std::string(log_home ? log_home : ".") + "/Library/Logs/v-radar-commands.log";
+#endif
+  static FILE* dbg = std::getenv("VRADAR_DEBUG") ? std::fopen(log_path.c_str(), "a") : nullptr;
   if (dbg) {
     std::fprintf(dbg, "cmd");
     for (size_t i = 0; i < len && i < 24; i++) std::fprintf(dbg, " %02x", p[i]);
@@ -357,17 +428,17 @@ void NavicoSim::Run() {
   while (!stop_) {
     // commands
     fd_set fds; FD_ZERO(&fds); int maxfd = -1;
-    for (auto& n : nics_) if (n.rx >= 0) { FD_SET(n.rx, &fds); maxfd = std::max(maxfd, n.rx); }
+    for (auto& n : nics_) if (n.rx >= 0) { FD_SET(FD_SOCK(n.rx), &fds); maxfd = std::max(maxfd, n.rx); }
     timeval tv{0, 5000};
     if (maxfd >= 0 && select(maxfd + 1, &fds, nullptr, nullptr, &tv) > 0) {
       for (auto& n : nics_) {
-        if (n.rx >= 0 && FD_ISSET(n.rx, &fds)) {
+        if (n.rx >= 0 && FD_ISSET(FD_SOCK(n.rx), &fds)) {
           uint8_t buf[1500];
-          ssize_t r = recv(n.rx, buf, sizeof buf, 0);
+          int r = (int)recv(n.rx, (char*)buf, (int)sizeof buf, 0);
           if (r > 0) HandleCommand(buf, (size_t)r);
         }
       }
-    } else if (maxfd < 0) { usleep(5000); }
+    } else if (maxfd < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
 
     auto now = clk::now();
     if (now - last_nic_check > std::chrono::seconds(3)) {

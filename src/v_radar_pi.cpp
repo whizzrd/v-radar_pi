@@ -164,8 +164,28 @@ bool VRadarEngine::Start(std::string& error) {
 
 void VRadarEngine::Stop() {
   m_timer.Stop();
+  m_cancel = true;  // the worker checks this between cells, so the join below does not wait for the whole ENC scan
   if (m_worker.joinable()) m_worker.join();
+  m_cancel = false;
+  FlushLog();  // on this (GUI) thread, while the DLL is certainly still loaded
   if (m_sim) { m_sim->Stop(); m_sim.reset(); }
+}
+
+void VRadarEngine::QueueLog(wxLogLevel level, std::string msg) {
+  std::lock_guard<std::mutex> l(m_log_mu);
+  m_log_queue.emplace_back(level, std::move(msg));
+}
+
+void VRadarEngine::FlushLog() {
+  std::vector<std::pair<wxLogLevel, std::string>> pending;
+  {
+    std::lock_guard<std::mutex> l(m_log_mu);
+    pending.swap(m_log_queue);
+  }
+  for (const auto& p : pending) {
+    if (p.first == wxLOG_Warning) wxLogWarning("%s", p.second);
+    else wxLogMessage("%s", p.second);
+  }
 }
 
 void VRadarEngine::ApplySettings() {
@@ -204,21 +224,28 @@ void VRadarEngine::EnsureRegion(double lat, double lon) {
 
 void VRadarEngine::ExtractAndLoad(double lat, double lon, double radius_nm, std::vector<std::string> dirs,
                                   std::string index_file) {
-  wxLogMessage("V-RADAR: reading ENC cells around %.3f %.3f (%zu chart directories)", lat, lon, dirs.size());
+  char buf[256];
+  std::snprintf(buf, sizeof buf, "V-RADAR: reading ENC cells around %.3f %.3f (%zu chart directories)", lat, lon, dirs.size());
+  QueueLog(wxLOG_Message, buf);
   radarsim::EncData data;
-  radarsim::CollectRegion(radarsim::FindEncCells(dirs), lat, lon, radius_nm, index_file, data);
+  radarsim::CollectRegion(radarsim::FindEncCells(dirs, &m_cancel), lat, lon, radius_nm, index_file, data, &m_cancel);
+  if (m_cancel) { m_extracting = false; return; }  // plugin is being stopped: drop the partial result
   if (data.cells_found == 0)
-    wxLogWarning("V-RADAR: no S-57 ENC cells (*.000) found in the OpenCPN chart directories; the radar will show no land");
-  else if (data.cells_used == 0)
-    wxLogWarning("V-RADAR: none of the %d ENC cells covers this area (%d skipped: not downloaded or unreadable)",
-                 data.cells_found, data.cells_skipped);
-  else if (data.cells_skipped > 0)
-    wxLogMessage("V-RADAR: %d ENC cells skipped (cloud placeholders or unreadable)", data.cells_skipped);
+    QueueLog(wxLOG_Warning, "V-RADAR: no S-57 ENC cells (*.000) found in the OpenCPN chart directories; the radar will show no land");
+  else if (data.cells_used == 0) {
+    std::snprintf(buf, sizeof buf, "V-RADAR: none of the %d ENC cells covers this area (%d skipped: not downloaded or unreadable)",
+                  data.cells_found, data.cells_skipped);
+    QueueLog(wxLOG_Warning, buf);
+  } else if (data.cells_skipped > 0) {
+    std::snprintf(buf, sizeof buf, "V-RADAR: %d ENC cells skipped (cloud placeholders or unreadable)", data.cells_skipped);
+    QueueLog(wxLOG_Message, buf);
+  }
   auto enc = std::make_shared<radarsim::EncScene>();
   enc->SetData(data);
   m_scene->Set(enc);
   m_cells_found = data.cells_found; m_cells_used = data.cells_used;
-  wxLogMessage("V-RADAR: ENC region loaded: %d cells, %zu edges, %zu marks", data.cells_used, data.segs.size(), data.pts.size());
+  std::snprintf(buf, sizeof buf, "V-RADAR: ENC region loaded: %d cells, %zu edges, %zu marks", data.cells_used, data.segs.size(), data.pts.size());
+  QueueLog(wxLOG_Message, buf);
   m_extracting = false;
 }
 
@@ -389,6 +416,7 @@ void VRadarEngine::UpdateWeather(const radarsim::OwnShip& ship) {
 
 void VRadarEngine::OnTimer(wxTimerEvent&) {
   m_tick++;
+  FlushLog();
   radarsim::OwnShip ship = m_plugin.OwnShip();
   EnsureRegion(ship.lat, ship.lon);
   UpdateWeather(ship);
